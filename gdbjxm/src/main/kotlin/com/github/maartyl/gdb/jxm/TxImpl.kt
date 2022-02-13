@@ -1,27 +1,43 @@
 package com.github.maartyl.gdb.jxm
 
-import com.github.maartyl.gdb.GDbSnap
-import com.github.maartyl.gdb.GDbTx
-import com.github.maartyl.gdb.GRef
-import com.github.maartyl.gdb.NodeBase
+import com.github.maartyl.gdb.*
 import kotlinx.coroutines.*
+import kotlin.coroutines.CoroutineContext
 
-internal open class SnapImpl(
+//the current snap in context
+// CAN ALSO contain Tx one must cast and check, if needed
+object KeySnapTx : CoroutineContext.Key<SnapImpl>
+
+internal abstract class SnapImpl(
   val g: GDbImpl,
   //full duration of slot in RwExec - for INTERNAL use
   val scopeSlot: CoroutineScope,
   // if not null: tracks all derefs
+  // TODO: extend to ALL things that can be seen: mainly: Index Queries
   private val seen: MutableSet<Ref<*>>?,
-) : GDbSnap {
+) : GDbSnap, CoroutineContext.Element {
 
-  override suspend fun <T : NodeBase> GRef<T>.deref(): T? {
+  override suspend fun <T : NodeBase> derefImpl(gRef: GRef<T>): NodeBase? {
     scopeSlot.ensureActive()
-    val r = asRef
+    val r = gRef.asRef
     seen?.add(r)
 
     return r.cachedNode.validOr { g.nodesGetAndCache(r) }
   }
 
+  override val key: CoroutineContext.Key<SnapImpl> get() = KeySnapTx
+}
+
+internal class SnapImplBlock<T>(
+  g: GDbImpl,
+  scopeSlot: CoroutineScope,
+  seen: MutableSet<Ref<*>>?,
+  private val block: suspend GDbSnap.() -> T,
+) : SnapImpl(g, scopeSlot, seen), suspend CoroutineScope.() -> T {
+
+  override suspend fun invoke(p1: CoroutineScope): T {
+    return block()
+  }
 }
 
 //TODO: pass in scope: how long usabe for + allows starting stuff, etc...
@@ -31,17 +47,29 @@ internal open class SnapImpl(
 // - it really would be best, if it could be part of coroutineScope inside block...
 // -- but any async updates (like reindexing, triggers ...) need to run in that
 
-internal class TxImpl(
+internal class TxImplBlock<T>(
+  g: GDbImpl,
+  scopeSlot: CoroutineScope,
+  seen: MutableSet<Ref<*>>?,
+  private val block: suspend GDbTx.() -> T
+) : TxImpl(g, scopeSlot, seen), suspend CoroutineScope.() -> T {
+  override suspend fun invoke(p1: CoroutineScope): T {
+    return runTx(block)
+  }
+}
+
+internal abstract class TxImpl(
   g: GDbImpl,
   scopeSlot: CoroutineScope,
   seen: MutableSet<Ref<*>>?,
   //active as long as mutation is allowed
   private val mutAllowed: CompletableJob = Job(scopeSlot.coroutineContext.job),
+  //TODO: maybe needs KeySnap in scope?
   val scopeMut: CoroutineScope = scopeSlot + mutAllowed,
 ) : SnapImpl(g, scopeSlot, seen), GDbTx {
   private val changes = mutableSetOf<Ref<*>>()
 
-  suspend fun <T> runTx(block: suspend GDbTx.() -> T): T = try {
+  protected suspend fun <T> runTx(block: suspend GDbTx.() -> T): T = try {
     g.chngo.txStart(this)
     block().also {
       //TOUP: instead do REQUESTS for passes and LOOP
@@ -72,13 +100,13 @@ internal class TxImpl(
     return g.internRef("%(${g.nodeIdGen.andIncrement.toString(Character.MAX_RADIX)})")
   }
 
-  override suspend fun <T : NodeBase> insertNew(node: T): GRef<T> {
+  override suspend fun <T : GPut> insertNew(node: T): GRef<T> {
     return genRef<T>().also { it.put(node) }
   }
 
   //  //MAY returns previous value, like map.put would -- may be confusing; not sure yet
 //  // - name it swap maybe... putSwap
-  override suspend fun <T : NodeBase> GRef<T>.put(node: T?) {
+  override suspend fun <T : GPut> GRef<T>.put(node: T?) {
     mutAllowed.ensureActive()
     val r = asRef
     val old = g.nodesPutSwap(r, node)

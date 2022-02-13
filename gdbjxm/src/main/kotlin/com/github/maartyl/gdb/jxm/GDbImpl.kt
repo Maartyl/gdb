@@ -19,6 +19,7 @@ import kotlinx.serialization.protobuf.ProtoBuf
 import org.mapdb.DB
 import org.mapdb.Serializer
 import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.coroutineContext
 
 
 //nodes must be Serializable
@@ -69,7 +70,8 @@ internal value class Valid<T>(val o: Any?) {
 //@OptIn(ExperimentalSerializationApi::class)
 //OOH! nice! This is not needed at all. - all is solved by polymorphic thingy - great
 //@Serializable(with = RefCtxSerializer::class)
-class Ref<T : NodeBase>(
+internal class Ref<T : NodeBase>(
+  val g: GDbImpl,
   //format: type(args)
   //- for now, args interpretation depends on type, BUT: cannot contain parens EXCEPT as grouping of subkeys
   // - comma should be used to separate multiple args, but only interpreted by the specific type
@@ -104,8 +106,9 @@ class Ref<T : NodeBase>(
   //   - the coll would be obtained similar to an index
   //   - ref.put(node) STILL possible, since Ref knows it's coll ..... dammit. UNTYPED ...
   //   - so, put would be more annoying ...
+  //   - MORE IMPORTANTLY: how would I get the coll when deserializing? from type in id?
   // well, not gonna do it for now, but possibility
-) : GRef<T> {
+) : GRef<T>, suspend GDbSnap.() -> NodeBase? {
 
   override fun hashCode(): Int {
     return id.hashCode()
@@ -132,6 +135,18 @@ class Ref<T : NodeBase>(
   fun cacheLatest(node: T?) {
     cachedNode = Valid.valid(node)
   }
+
+  override suspend fun derefImpl(): NodeBase? = when (val snap = coroutineContext[KeySnapTx]) {
+    null -> {
+      //TODO: mark this as FAST qry
+      g.read(this)
+    }
+    else -> {
+      snap.derefImpl(this)
+    }
+  }
+
+  override suspend fun invoke(snap: GDbSnap): NodeBase? = snap.derefImpl(this)
 }
 
 internal val <T : NodeBase> GRef<T>.asRef get() = this as? Ref<T> ?: error("bad Ref $this")
@@ -249,7 +264,7 @@ internal class GDbImpl(
 
   @Suppress("UNCHECKED_CAST")
   fun <T : NodeBase> internRef(id: String): Ref<T> {
-    return weakRefs.getOrPut(id) { Ref<T>(id) } as Ref<T>
+    return weakRefs.getOrPut(id) { Ref<T>(this, id) } as Ref<T>
   }
 
   private val grefSeri = InterningGRefSerializer(this::internRefUntyped)
@@ -267,14 +282,12 @@ internal class GDbImpl(
   }
 
   @Suppress("UNCHECKED_CAST")
-  private val nodes = rw.hashMap(C.NODES, Serializer.STRING, Serializer.BYTE_ARRAY)
-    .createOrOpen()
+  private val nodes = rw.hashMap(C.NODES, Serializer.STRING, Serializer.BYTE_ARRAY).createOrOpen()
 
   @Suppress("UNCHECKED_CAST")
   suspend fun <T : NodeBase> nodesGetAndCache(ref: Ref<T>): T? {
     return withContext(ioDispatcher) { nodes[ref.id] }?.let {
-      @OptIn(ExperimentalSerializationApi::class)
-      proto.decodeFromByteArray(nodeSeri, it) as T
+      @OptIn(ExperimentalSerializationApi::class) proto.decodeFromByteArray(nodeSeri, it) as T
     }.also { ref.cacheLatest(it) }
   }
 
@@ -288,8 +301,8 @@ internal class GDbImpl(
     } else {
       val nodeBase: NodeBase = node
 
-      @OptIn(ExperimentalSerializationApi::class)
-      val serNode = proto.encodeToByteArray(nodeSeri as KSerializer<NodeBase>, nodeBase)
+      @OptIn(ExperimentalSerializationApi::class) val serNode =
+        proto.encodeToByteArray(nodeSeri as KSerializer<NodeBase>, nodeBase)
 
       withContext(ioDispatcher) {
         //there is no way to NOT deserialize old value (when already in cachedNode)
@@ -297,9 +310,12 @@ internal class GDbImpl(
       }
     }
     //assumes called BEFORE ref updated -- cachedNode still valid
-    return if (oldSerNode == null) null else
-      @OptIn(ExperimentalSerializationApi::class)
-      ref.cachedNode.validOr { proto.decodeFromByteArray(nodeSeri, oldSerNode) as T }
+    return if (oldSerNode == null) null else @OptIn(ExperimentalSerializationApi::class) ref.cachedNode.validOr {
+      proto.decodeFromByteArray(
+        nodeSeri,
+        oldSerNode
+      ) as T
+    }
 
   }
 
@@ -311,9 +327,7 @@ internal class GDbImpl(
   val tmpIndexNames = mutableSetOf<String>()
 
   override fun <TR : Any> reverseIndexRawStr(
-    name: String,
-    seri: (TR) -> String,
-    view: (GRef<*>, NodeBase, MutableCollection<TR>) -> Unit?
+    name: String, seri: (TR) -> String, view: (GRef<*>, NodeBase, MutableCollection<TR>) -> Unit?
   ): GRangeIndex<TR, *> {
     checkBuilding()
     if (name in tmpIndexNames) error("Repeated index name: $name")
@@ -324,9 +338,7 @@ internal class GDbImpl(
   }
 
   override fun <TR : Any> reverseIndexRawLong(
-    name: String,
-    seri: (TR) -> Long,
-    view: (GRef<*>, NodeBase, MutableCollection<TR>) -> Unit?
+    name: String, seri: (TR) -> Long, view: (GRef<*>, NodeBase, MutableCollection<TR>) -> Unit?
   ): GRangeIndex<TR, *> {
     checkBuilding()
     if (name in tmpIndexNames) error("Repeated index name: $name")
@@ -337,8 +349,7 @@ internal class GDbImpl(
   }
 
   override fun <TR : NodeBase> reverseIndexRawGRef(
-    name: String,
-    view: (GRef<*>, NodeBase, MutableCollection<GRef<TR>>) -> Unit?
+    name: String, view: (GRef<*>, NodeBase, MutableCollection<GRef<TR>>) -> Unit?
   ): GIndex<GRef<TR>, *> = run {
     checkBuilding()
     if (name in tmpIndexNames) error("Repeated index name: $name")
@@ -371,7 +382,7 @@ internal class GDbImpl(
 
       executor.enqueue(object : RwSlot {
         override val readOnly = readOnly
-        override suspend fun startAndJoin() {
+        override suspend fun invoke(mustIgnore: CoroutineScope) {
           work.join()
           h.dispose()
         }
@@ -387,11 +398,13 @@ internal class GDbImpl(
   }
 
   override suspend fun <T> read(block: suspend GDbSnap.() -> T): T = execEnqueue(readOnly = true) {
-    SnapImpl(this@GDbImpl, this, null).block()
+    val snap = SnapImplBlock(this@GDbImpl, this, null, block)
+    withContext(snap, snap)
   }
 
   override suspend fun <T> mutate(block: suspend GDbTx.() -> T): T = execEnqueue(readOnly = false) {
-    TxImpl(this@GDbImpl, this, seen = null).runTx(block)
+    val tx = TxImplBlock(this@GDbImpl, this, seen = null, block)
+    withContext(tx, tx)
   }
 
   //cannot be SharedFlow - I could have a MAP of them, and un/register them as collectorsCount changes, but not worth it
@@ -420,28 +433,31 @@ internal class GDbImpl(
 
         //starts with none - fine, as it will run anyway
         val toLookOutFor: MutableSet<Ref<*>> = mutableSetOf()
+
+        //TODO: also seen INDEX lookups
+        // - they are NOT necessarily covered by ref changes...
+        // (for example: new node got added to the result set but never deref-ed in the subscription, etc.)
       }
       try {
+// - SO long as I RUN - no TX can run - so: gotta register BEFORE I finish
+        while (true) {
 
+          //TODO: A!!! FFS ... what if change to INDEX ?? I would not be notified...
+          // - all "root" things need to be saved in "seen" - including "checked index for key X"
+          // - without this, could now be returning a different set, and I would not notice
+
+          val toEmit = execEnqueue(readOnly = true) {
+            obs.changeSeen.value = false
+            obs.toLookOutFor.clear()
+            val snap = SnapImplBlock(this@GDbImpl, this, obs.toLookOutFor, block)
+            withContext(snap, snap)
+          }
+          emit(toEmit)
+
+          obs.changeSeen.first { it } //suspend until something seen to have changed
+        }
       } finally {
         //TODO: unregister obs
-      }
-      //hmm... this is a nice idea, but how to not MISS changes BETEEN registers?
-      // - SO long as I RUN - no TX can run - so: gotta register BEFORE I finish
-      while (true) {
-
-        //TODO: A!!! FFS ... what if change to INDEX ?? I would not be notified...
-        // - all "root" things need to be saved in "seen" - including "checked index for key X"
-        // - without this, could now be returning a different set, and I would not notice
-
-        val toEmit = execEnqueue(readOnly = true) {
-          obs.changeSeen.value = false
-          obs.toLookOutFor.clear()
-          SnapImpl(this@GDbImpl, this, obs.toLookOutFor).block()
-        }
-        emit(toEmit)
-
-        obs.changeSeen.first { it } //suspend until something seen to have changed
       }
 
 

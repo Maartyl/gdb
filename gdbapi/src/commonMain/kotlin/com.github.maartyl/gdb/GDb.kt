@@ -5,6 +5,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.serialization.ContextualSerializer
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.KSerializer
@@ -12,21 +13,82 @@ import kotlinx.serialization.Serializable
 
 //represents ID of a Node in Graph
 // - must be "serializable"
+// ACTUALLY: completely unused: GRef<*> is good enough, if not better.
+// -- maybe remove completely?
 interface GId
 
+//ACTUALLY - UNUSABLE if class - if I want GRef to be able to point to Interfaces
+// - can ONLY be an interface that all those interfaces would have to extend
 typealias NodeBase = Any
 
 //represents a TYPED ID of a Node with value T.
 // T is just a HINT - can be unsafeCast to anything, and will still work, until someone tries to use derefed value
 @Serializable(with = GRefCtxSerializer::class)
-interface GRef<T : NodeBase> : GId
+interface GRef<out T : NodeBase> : GId {
+  //IF inside Snap: uses snap to deref
+  //IF outside: starts new read-only qry
+  suspend fun derefImpl(): NodeBase?
+
+  //TODO: can this cause deadlock or so?
+  // - ONLY if a QRY WAITS for a deref, made WITHOUT qry context - which is WRONG to do.
+  // - so, yes, slightly unsafe, but... probably not for anything correct
+
+  //TODO: there are multiple deref options
+  // - ignoring snaps, check cache first - very fast
+  // - check snap, use that - null/throw outside snap
+  // - check snap, if outside: start read qry
+  // different may be desired at different times, BUT: very annoying to need to pass in the Snap directly ...
+  // - it made it impossible to implement the inline cast check deref ... - so, needed through ctx...
+}
+
+suspend inline fun <reified T : NodeBase> GRef<T>.deref() = derefImpl() as? T
+suspend inline operator fun <reified T : NodeBase> GRef<T>.invoke(snap: GDbSnap) = snap.derefImpl(this) as? T
+
+//TODO: idea GKey vs GPut
+// - GKey : GRef and ONLY GKey can be used for PUT - to avoid putting accidentally wrong
+// - or GPut ifce for "top" objs for storing in DB, and only those can be put in DB - for the same reason
+//   - would replace :NodeBase in those api: as NodeBase will have to be an ifce, and GTop can always extend it.
+//   - alt name: GObj or ... GNode ? (as in, the whole node)
+// I have no RT mechanism to CHECK that a value is valid to be put into a Ref.
+
+//to be implemented by ALL nodes to be saveable in DB
+// BUT: only by FINAL types. (not interfaces, not intermediate) OR if Ref MEANT to be "Sealed union" then that.
+// - This assures, that PUT is never done with something unexpected
+// (must always cast ref to  GRef<T:GPut> to be sure - reminder
+// - does NOT fully assure all perfect, but good enough...
+// - each Ref should be associated with a
+/** Represents an Object (Node) that can be PUT into the graph database.*/
+interface GPut /*: NodeBase*/ {
+  //TODO: scope impl  // user can create subscopes, and CLOSE them - that DELETES all nodes under that scope
+  //      and transitively also closes all subscopes
+  //      99% sure: Scopes should NOT be possible to restart: once over, is over.
+  // val lifeScope : {dflt=Forever, Mem, SubScope(scope)}
+  // - NOT GOOD:
+  //   - Needs an arbitrary EDGE; mainly: to belong to multiple scopes
+  //   also, there is no reason why arbitrary obj cannot be a scope - what matters are the connections
+  //   so maybe: LifeScopeEdge{src:Scope=GRef<Any>, dst:GRef<Any>= to be deleted when src is deleted}
+  //   BUT: this requires storing an extra OBJECT for each ... but is independent...
+  // OR: have scopes, have single parent, BUT allow MULTI-SCOPE obj - a Subscope of multiples scopes...
+  // - managing the extra edge-objects would be annoying and error prone...
+
+  //mem scope problem: find on indexes must be implemented differently.
+  // - if different map: wrong ORDER in iterating index
+  // - but mem objs are FUTURE thing ...
+}
+
+//TODO:  "FK edges" == auto delete edge, if it references node that gets deleted
+// - or rather! INDEXES! option to an index on GRef to:
+// -- if deleted, delete me too ...
 
 interface GIndex<TKey : Any, TN : NodeBase> {
   //name of this index
   val name: String
 
-  fun find(snap: GDbSnap, key: TKey): Sequence<GRef<TN>>
+  fun find(snap: GDbSnap, key: TKey): Flow<GRef<TN>>
 }
+
+@Suppress("NOTHING_TO_INLINE")
+inline fun <TN : NodeBase> GIndex<Unit, TN>.find(snap: GDbSnap) = find(snap, Unit)
 
 interface GRangeIndex<TKey : Any, TN : NodeBase> : GIndex<TKey, TN> {
 
@@ -58,13 +120,15 @@ interface GRangeIndex<TKey : Any, TN : NodeBase> : GIndex<TKey, TN> {
 //NAME: maybe IDENTITY index ? - as the key is all-time identity of the node ...
 // is UniqueIndex, but skipping dealing with it for now
 interface GPrimaryStrIndex<TN : NodeBase> : GIndex<String, TN> {
+  //TODO: decide: should be TN:GPut ?
 
   //derives Ref, whether inserted or not
   fun deriveRef(key: String): GRef<TN>
 
   //TODO: maybe do not return if not in DB ?
-  override fun find(snap: GDbSnap, key: String): Sequence<GRef<TN>> {
-    return sequenceOf(deriveRef(key))
+  // - probably not important: nobody will be using FIND on primary index anyway
+  override fun find(snap: GDbSnap, key: String): Flow<GRef<TN>> {
+    return flowOf(deriveRef(key))
   }
 
   fun primaryKeyOf(node: TN): String
@@ -74,7 +138,7 @@ interface GPrimaryStrIndex<TN : NodeBase> : GIndex<String, TN> {
 //  }
 }
 
-suspend fun <TN : NodeBase> GDbTx.put(idx: GPrimaryStrIndex<TN>, node: TN): GRef<TN> {
+suspend fun <TN : GPut> GDbTx.put(idx: GPrimaryStrIndex<TN>, node: TN): GRef<TN> {
   //acts as insertOrReplace
   return idx.deriveRef(idx.primaryKeyOf(node)).also { it.put(node) }
 }
@@ -247,8 +311,7 @@ interface GDb {
   //emits null if not in DB
   fun <T : NodeBase> subscription(ref: GRef<T>): Flow<T?>
 
-  //if any of refs changes, recomputes and emits
-  //ALSO: tracks all deferred refs from last invoke of block, and if any of THOSE change: also reruns
+  //tracks all deferred refs from last invoke of block, and if any of those change: reruns
   fun <T> subscription(block: suspend GDbSnap.() -> T): Flow<T>
 }
 
@@ -256,7 +319,7 @@ interface GDb {
 interface GDbSnap {
 
   //null if not in graph
-  suspend fun <T : NodeBase> GRef<T>.deref(): T?
+  suspend fun <T : NodeBase> derefImpl(gRef: GRef<T>): NodeBase?
 
   //final
   //cannot be defined as extension, since it's using it
@@ -264,21 +327,23 @@ interface GDbSnap {
 //  fun <T : NodeBase> GRef<T>.deref(): T? = deref(this)
 }
 
-suspend inline fun <T : NodeBase> GDbSnap.deref(ref: GRef<T>) = ref.deref()
+inline val <T : GDbSnap> T.snap get() = this
 
 // NOT THREAD SAFE - It is your responsibility to not access it concurrently WITHIN one transaction.
 // - separate transactions are independent - that is fine
 // - must not be used after mutate{} completes
 interface GDbTx : GDbSnap {
   //creates a node with NEW ID
-  suspend fun <T : NodeBase> insertNew(node: T): GRef<T>
+  suspend fun <T : GPut> insertNew(node: T): GRef<T>
 
   //MAYBE: better name
   //inserts or updates or removes
-  suspend fun <T : NodeBase> GRef<T>.put(node: T?)
+  // UNSAFE VARIANCE - theoretically allows to put ANY value to all refs cast to arbitrary T
+  // - put MUST be done CAREFULLY and correctly, as the rest of app expects
+  suspend fun <T : GPut> GRef<T>.put(node: T?)
 }
 
-suspend inline fun <T : NodeBase> GDbTx.put(ref: GRef<T>, node: T?) = ref.put(node)
+suspend inline fun <T : GPut> GDbTx.put(ref: GRef<T>, node: T?) = ref.put(node)
 
 @OptIn(ExperimentalSerializationApi::class)
 object GRefCtxSerializer : KSerializer<GRef<*>> by ContextualSerializer(GRef::class, null, arrayOf())

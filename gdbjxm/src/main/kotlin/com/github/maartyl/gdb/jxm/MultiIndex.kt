@@ -4,6 +4,11 @@ import com.github.maartyl.gdb.GDbSnap
 import com.github.maartyl.gdb.GRangeIndex
 import com.github.maartyl.gdb.GRef
 import com.github.maartyl.gdb.NodeBase
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.asFlow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import org.mapdb.DataInput2
 import org.mapdb.DataOutput2
@@ -57,10 +62,6 @@ internal class MultiIndex<Key : Any, KeyB : Comparable<KeyB>, Node : NodeBase>(
     //.counterEnable()
     .createOrOpen()
 
-  //TODO: better, maybe even support using STRING instead of byte?
-  // - maybe somehow custom sortable? - share impl for orderedIndex ?
-  //@OptIn(ExperimentalSerializationApi::class)
-  //private fun bs(k: Key) = g.proto.encodeToByteArray(seri, k)
   private fun bs(k: Key) = seri(k)
 
   private fun pack(k: Key, ref: Ref<*>) = KR<KeyB>(bs(k), ref.id)
@@ -97,7 +98,7 @@ internal class MultiIndex<Key : Any, KeyB : Comparable<KeyB>, Node : NodeBase>(
   }
 
   override fun <TN : NodeBase> onNodeChanged(tx: TxImpl, ref: Ref<TN>, old: TN?, new: TN?) {
-    //TODO: am I allowed to call equals ?
+    //TODO: am I allowed to call equals ? - Yes, but probably not worth it.
     // this check also (mainly) gets rid of BOTH null
     if (old === new) return
 
@@ -137,10 +138,57 @@ internal class MultiIndex<Key : Any, KeyB : Comparable<KeyB>, Node : NodeBase>(
 
   // --------------
 
-  override fun find(snap: GDbSnap, key: Key): Sequence<GRef<Node>> {
+  override fun find(snap: GDbSnap, key: Key): Flow<GRef<Node>> {
+    //TODO: add BUFFER param for OPTIMIZATION of "want many = use buffer" vs "want 'single' = don't load more ahead"
+    // AND if I do the "replay" or "caching" - option to SKIP that if expects TOO MANY
+    // - maybe use "buffer = Infinite" to disable that ? ... well, no ...buffer is something else...
     val b = bs(key)
+    val snp = snap as SnapImpl
+    snp.scopeSlot.ensureActive()
+    //TODO: setup cache?
+    //  - MutableList that becomes source for key
+    //  - becomes usable once the flow fully consumed
+    //  - valid until index changes
+    //  - HA!! SharedFlow auto solves this!
+    //    TODO: add to MAP in Snap so other invokes with the same key SHARE the same SharedFlow
+
+    //TODO: add to SEEN in snap
+
+    //FIXME:   DAMMIT ... SharedFlow actually WRONG ...
+    // - as it is a CHILD of the slot, unless read to END launch will NEVER COMPLETE
+    // -- even if flow collect gets cancelled...
+    // -- and snap-scope will NEVER complete ...
+    // - EITHER I cannot use this ... or I have to CANCEL the launch somehow
+    // -- maybe at the end of Snap ?
+    // --- maybe cancel ALL children, after Snap "body" completes?
+
+    //TODO: if i have "unlimited" replay: can just share the same Flow for ALL invokes ... (with the same key)
+//    MutableSharedFlow<GRef<Node>>(replay = Int.MAX_VALUE).also { msf ->
+//      snp.scopeSlot.launch(snp.g.ioDispatcher) {
+//        val matchSet = multimap.subSet(KR(b, "", -1), KR(b, "", 1))
+//        for (kr in matchSet) {
+//          msf.emit(g.internRef(kr.ref))
+//        }
+//      }
+//    }//.also { return it }
+
+    //TODO: this variant is NOT checking snp.scopeSlot.ensureActive()
+    //TODO: OPTIMIZE the buffer, if I go with this impl for a longer time
     val matchSet = multimap.subSet(KR(b, "", -1), KR(b, "", 1))
-    return matchSet.asSequence().map { g.internRef(it.ref) }
+    return matchSet.asFlow().map { g.internRef<Node>(it.ref) }.flowOn(snp.g.ioDispatcher)
+
+//    return flow {
+//      snp.scopeSlot.ensureActive()
+//      val matchSet = multimap.subSet(KR(b, "", -1), KR(b, "", 1))
+//      matchSet.asFlow()
+//      for (kr in matchSet) {
+//        emit(g.internRef<Node>(kr.ref))
+//        snp.scopeSlot.ensureActive()
+//      }
+//    }.flowOn(snp.g.ioDispatcher)
+
+//    val matchSet = multimap.subSet(KR(b, "", -1), KR(b, "", 1))
+//    return matchSet.asSequence().map { g.internRef(it.ref) }
   }
 
 }
